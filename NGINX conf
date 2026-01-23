@@ -1,0 +1,78 @@
+# /etc/nginx/nginx.conf
+user nginx;
+worker_processes auto;
+error_log /var/log/nginx/error.log warn;
+pid /var/run/nginx.pid;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+
+    log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                    '$status $body_bytes_sent "$http_referer" '
+                    '"$http_user_agent" "$http_x_forwarded_for"';
+
+    access_log /var/log/nginx/access.log main;
+
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+
+    keepalive_timeout 65;
+    gzip on;
+
+    # Load balancing upstream block for backend
+    upstream backend_servers {
+        least_conn;  # can also use round-robin or ip_hash
+        server 127.0.0.1:5000;
+        server 127.0.0.1:5001;
+        server 127.0.0.1:5002;
+    }
+
+    # Server block for MERN app
+    server {
+        listen 80;
+        server_name example.com www.example.com;
+
+        # Frontend (React build)
+        root /var/www/frontend;
+        index index.html index.htm;
+
+        location / {
+            try_files $uri /index.html;
+        }
+
+        # Reverse proxy for backend API with load balancing
+        location /api/ {
+            proxy_pass http://backend_servers;
+            proxy_http_version 1.1;
+
+            # For WebSocket support
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+
+            # Preserve client info
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+
+            # Optional: timeout settings
+            proxy_connect_timeout 5s;
+            proxy_send_timeout 30s;
+            proxy_read_timeout 30s;
+        }
+
+        # Logging
+        access_log /opt/homebrew/var/log/nginx/access.log;
+        error_log /opt/homebrew/var/log/nginx/error.log;
+
+        # Optional: favicon / robots
+        location = /favicon.ico { log_not_found off; access_log off; }
+        location = /robots.txt  { log_not_found off; access_log off; }
+    }
+}
