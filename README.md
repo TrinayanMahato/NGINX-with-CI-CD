@@ -9,7 +9,8 @@ forwarded client headers.
 ## Table of Contents
 
 - [What This Config Does](#what-this-config-does)
-- [Request Routing](#request-routing)
+- [Architecture](#architecture)
+- [Extending This Setup](#extending-this-setup)
 - [Installing](#installing)
 - [Adapting It](#adapting-it)
 - [Configuration Walkthrough](#configuration-walkthrough)
@@ -30,25 +31,83 @@ forwarded client headers.
 
 ---
 
-## Request Routing
+## Architecture
+
+One NGINX process serving two completely different kinds of traffic from the same port:
+static files for the application shell, and proxied requests for the API.
 
 ```
-                    ┌─────────────────────────────┐
-  GET /            │  try_files $uri /index.html │ ──► /var/www/frontend
-  GET /dashboard   │  (SPA fallback)             │
-                    └─────────────────────────────┘
-
-                    ┌─────────────────────────────┐      127.0.0.1:5000
-  GET  /api/users   │  proxy_pass                 │ ──►  127.0.0.1:5001
-  POST /api/login   │  http://backend_servers     │      127.0.0.1:5002
-  WS   /api/socket  │  (least_conn)               │
-                    └─────────────────────────────┘
+                        :80
+                         │
+              ┌──────────┴──────────┐
+              │   server block      │
+              │   example.com       │
+              └──────────┬──────────┘
+                         │
+        ┌────────────────┴────────────────┐
+        │                                 │
+  location /                        location /api/
+  try_files $uri /index.html        proxy_pass
+        │                                 │
+        ▼                                 ▼
+  /var/www/frontend              upstream backend_servers
+  React build                    ┌──────────────────────┐
+  (served from disk)             │  least_conn          │
+                                 ├──────────────────────┤
+                                 │ 127.0.0.1:5000       │
+                                 │ 127.0.0.1:5001       │
+                                 │ 127.0.0.1:5002       │
+                                 └──────────────────────┘
 ```
 
-Any path that is not a real file falls through to `index.html`, which is what lets React
-Router handle `/dashboard` without a 404 from NGINX.
+### The two paths
 
----
+| Path | Mechanism | Why |
+| :--- | :--- | :--- |
+| `/` and any unmatched URL | `try_files $uri /index.html` | Serves a real file if it exists, otherwise hands the SPA shell to the client so React Router can resolve the route |
+| `/api/` | `proxy_pass http://backend_servers` | Forwards to the Node pool, load balanced |
+
+`try_files` is what makes a hard refresh on `/dashboard` work. Without it NGINX would look
+for a directory of that name, find nothing, and return 404 — the client-side router never
+gets the chance to run.
+
+### Load balancing
+
+`least_conn` routes each request to the backend with the fewest active connections. That
+suits an API where request durations vary, since round-robin can queue a slow request
+behind another slow one on the same worker while a free worker sits idle.
+
+### Proxy header contract
+
+Once traffic passes through a proxy, the backend loses sight of the original client. Four
+headers restore it, and the upgrade pair enables WebSockets:
+
+| Header | Restores |
+| :--- | :--- |
+| `Host` | The hostname the client actually requested |
+| `X-Real-IP` | The client address, for logging and rate limiting |
+| `X-Forwarded-For` | The full proxy chain |
+| `X-Forwarded-Proto` | Whether the original request was HTTPS |
+| `Upgrade` / `Connection` | The HTTP→WebSocket handshake |
+
+`proxy_http_version 1.1` is required alongside the upgrade headers — HTTP/1.0 has no
+concept of a connection upgrade, so omitting that line breaks WebSockets silently while
+ordinary requests keep working.
+
+### Timeouts
+
+`proxy_connect_timeout 5s` fails fast when a backend is down, so a dead worker costs five
+seconds rather than hanging the request. `proxy_read_timeout 30s` bounds how long NGINX
+waits for a response — note it also caps idle WebSocket connections, so long-lived sockets
+need it raised.
+
+## Extending This Setup
+
+- **TLS** — `certbot --nginx -d yourdomain.com` rewrites the server block for HTTPS.
+- **Pipeline** — a workflow validating this file with `nginx -t` on every pull request,
+  linting it with `gixy`, and reloading the host after a successful check on merge.
+- **Rate limiting** — `limit_req_zone` in the `http` block, applied to `/api/`.
+- **Caching** — `proxy_cache` for idempotent API responses.
 
 ## Installing
 
@@ -144,14 +203,3 @@ tail -f /var/log/nginx/access.log
 ```
 
 ---
-
-## On the CI/CD in the Name
-
-The repository is named *NGINX-with-CI-CD*, but it currently contains only the NGINX
-configuration — there is no pipeline definition here yet. A natural next step is a
-workflow that validates and ships this file, for example:
-
-- [ ] Run `nginx -t` against the config on every pull request
-- [ ] Lint with `gixy` for common misconfigurations and security issues
-- [ ] Deploy to the target host on merge to `main`
-- [ ] Reload NGINX only after the syntax check passes on the host
